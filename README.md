@@ -38,6 +38,8 @@ I prepared code you can see in this repository with some use-cases and extensive
 
 Details could be found in the use-cases below and in the source code.
 
+Question at Kotlin Coroutines Q&A here https://github.com/Kotlin/kotlinx.coroutines/discussions/4490
+
 ---
 
 ## Use-case 1: Simple Coroutine, return value
