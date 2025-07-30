@@ -1,24 +1,50 @@
 # Kotlin Coroutines internal behavior when exceptions are thrown and/or Jobs are canceled
 
-During discussions with a fellow developer we open a topic about catching `kotlinx.coroutines.JobCancellationException` and getting cause from it.
+During discussions with a fellow developer we open a topic about catching `kotlinx.coroutines.JobCancellationException` 
+and getting cause from this exception for further processing.
 
 I was arguing that this exception is internal and is kind of implementation detail that should not be touched. From implementation of it's
 `kotlinx.coroutines.JobCancellationException.fillInStackTrace()` method, you can figure out that it is fast-throw kind of exception
 (_trick is about not calling `java.lang.Throwable.fillInStackTrace(int)` and keep `java.lang.Throwable.stackTrace` field as empty array -
 DO NOT DO THIS, IF YOU DO NOT KNOW WHAT YOU ARE DOING_).
-It is usually used when you want to roll back whole deeply nested stack till first `catch` statement, where you will somehow process it.
+It is usually used when you want to roll back whole deeply nested stack till first `catch` statement, where you will somehow process this state.
 Similar patter is used when you implement the Interpreter pattern in Java and want to support `break` and `continue` statements in you DSL.
 
-My fellow developer had an idea, that he will catch it and rethrow it's `cause`. Because he was seeing strange behavior, and wanted to duck-tape
-an actual problem.
+My fellow developer had an idea, that he will catch it and rethrow it's `cause`. Because he was seeing strange behavior of exceptions thrown, 
+and wanted to duck-tape an actual problem.
 
 This was an interesting topic to jump into rabbit hole and explore :)
 
 I prepared code you can see in this repository with some use-cases and extensive logging, to be able to see what is happening under the hood.
 
+## TL;DR
+
+- Behavior of program is different when you have `-Dkotlinx.coroutines.debug` JVM option on or off.
+  - When it is ON, Kotlin Coroutine machinery tries to create a copy of your "business" exception - see `MyException` sample.
+    - And then it is doing some Exception's stack-trace manipulation.
+    - see https://github.com/Kotlin/kotlinx.coroutines/blob/1.10.2/kotlinx-coroutines-core/jvm/src/internal/StackTraceRecovery.kt#L69
+  - When it is not able to create duplicate of your exception, then it behaves like not JVM option is turned ON - see `MyExocitException` sample.
+    - No Exception's stack-trace manipulation.
+- When we have **Coroutine-A** which after some delay throw exception,
+  - and have another **Coroutine-XXX** that is doing some heavy work (does not finis work before Coroutine-A), and both are in same `CoroutineScope`. 
+  - Then **Coroutine-XXX** is cancelled by `kotlinx.coroutines.JobCancellationException`,
+  - and `rootCause` is exception thrown from **Coroutine-A**.
+  - This means that you can catch irrelevant exception from other part of your business logic, something that you do not expect.
+- Similar situation is when we have two async (for example using `Dispatchers.IO` dispatcher) coroutines **Coroutine-A** and **Coroutine-B**,
+  - and they throw exception at the same time.
+  - Now decision which will be thrown from `CoroutineScope` context is non-deterministic.
+  - We have same "problem" with `rootCause`.
+  - Good news is that in both cases second exception will be part of `java.lang.Throwable.suppressedExceptions` list. So, no exception will be swallowed.
+
+Details could be found in the use-cases below and in the source code.
+
+---
+
 ## Use-case 1: Simple Coroutine, return value
 
 Basic coroutine that delays for time (to mimic heavy processing) and then ends. Nothing unexpected is happening here.
+
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L12-L34
 
 ```
 main: MAIN begin
@@ -62,6 +88,8 @@ And adds **original** exception `hashCode=5af97850` as **rootCause** of **duplic
 Mind that duplicate exception has completely different stack-trace.
 
 Then you can see that we catch **duplicate** in `runBlocking` and `main` try/catch blocks.
+
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L36-L59
 
 ```
 main: MAIN begin
@@ -164,6 +192,8 @@ org.example.MyException: <DelayAndThrowCoroutine> !!exception!!@55ca8de8
 Interesting stuff happens when Kotlin Coroutines machinery is unable to duplicate the original exception. In this case, only one
 exception `hashCode=419c5f1a` is used as you can see from the log.
 
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L36-L59
+
 ```
 main: MAIN begin
  main @coroutine#1: runBlocking begin
@@ -246,6 +276,8 @@ Without this option, we can see that output is the same as when run without this
 This example is very similar to Use-case 1, but it computes value using `async` coroutine.
 From the console log, nothing shocking is happening.
 
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L61-L94
+
 ```
 main: MAIN begin
  main @coroutine#1: runBlocking begin
@@ -286,6 +318,8 @@ This is different to previous use-cases, where only one duplicate exception was 
 **Second exception** `hashCode2=7722c3c3` is used to escape `runCatching` method.
 
 Both of them have **original exception** `hashCode=691a7f8f` as `rootCause`.
+
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L97-L129
 
 ```
 main: MAIN begin
@@ -374,6 +408,8 @@ Interesting stuff happens when Kotlin Coroutines machinery is unable to duplicat
 exception `hashCode=5276e6b0` is used as you can see from the log.
 
 Execution is the same with "Use-case 4a".
+
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L97-L129
 
 ```
 main: MAIN begin
@@ -466,6 +502,8 @@ From the log below, we can see that both jobs are canceled by `kotlinx.coroutine
 Interesting is that exception has same instance as `rootCause` - more details/questions below.
 
 This one exception cancels the whole execution of coroutine.
+
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L131-L175
 
 ```
 main: MAIN begin
@@ -574,6 +612,8 @@ What is interesting here is:
 - Duplicate Exception is thrown from our code, and original is set as root-cause
 - Coroutines `AAA` and `BBB` are canceled by `kotlinx.coroutines.JobCancellationException`, but they have the root-cause set to irrelevant exception `org.example.MyException("FIRST")@0e50a6f6`.
 
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L177-L216
+
 ```
 main: MAIN begin
  main @coroutine#1: runBlocking begin
@@ -665,6 +705,8 @@ Interesting stuff happens when Kotlin Coroutines machinery is unable to duplicat
 exception `hashCode=05dd6264` is used as you can see from the log.
 
 Execution is the same with "Use-case 6a".
+
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L177-L216
 
 ```
 main: MAIN begin
@@ -774,6 +816,8 @@ We can see similar patterns like in previous Use-cases:
 
 **Note:** Depends on execution but which coroutine, and its exception will become **master**, is totally random.
 Each run of this sample program will return them in different "order".
+
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L218-L259
 
 ```
 main: MAIN begin
@@ -893,6 +937,8 @@ Interesting stuff happens when Kotlin Coroutines machinery is unable to duplicat
 exceptions `hashCode=67e6cdde` and `hashCode=776eda48` from coroutines `ex-AAA` and `ex-BBB` are used as you can see from the log.
 
 Execution is the same with "Use-case 7a".
+
+https://github.com/bedla/kotlin-coroutines-cancellation-jumping-exception/blob/master/src/main/kotlin/Main.kt#L218-L259
 
 ```
 main: MAIN begin
